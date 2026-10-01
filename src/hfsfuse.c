@@ -29,6 +29,106 @@
 #define closelog() ((void)0)
 #endif
 
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#include <wchar.h>
+#include <time.h>
+
+#ifndef HFSFUSE_VERSION_STRING
+#include "version.h"
+#endif
+
+// winfsp-x64.dll is delay-loaded; load it by full path from the WinFsp install directory
+// so hfsfuse runs without WinFsp's bin directory in PATH (e.g. under WinFsp.Launcher).
+static int hfsfuse_win_load_winfsp(void) {
+	wchar_t path[MAX_PATH];
+	DWORD size = sizeof(path);
+	if(RegGetValueW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\WOW6432Node\\WinFsp", L"InstallDir", RRF_RT_REG_SZ,
+	                NULL, path, &size) != ERROR_SUCCESS) {
+		fputs("Error: WinFsp is not installed (registry key HKLM\\SOFTWARE\\WOW6432Node\\WinFsp not found)\n", stderr);
+		return -1;
+	}
+	size_t len = wcslen(path);
+	if(len + wcslen(L"bin\\winfsp-x64.dll") + 2 > MAX_PATH)
+		return -1;
+	if(len && path[len-1] != L'\\')
+		path[len++] = L'\\';
+	wcscpy(path + len, L"bin\\winfsp-x64.dll");
+	if(!LoadLibraryW(path)) {
+		fprintf(stderr, "Error: could not load %ls (Windows error %lu)\n", path, (unsigned long)GetLastError());
+		return -1;
+	}
+	return 0;
+}
+
+// Under WinFsp.Launcher there is no console, so send diagnostics to %ProgramData%\hfsfuse\hfsfuse.log
+static void hfsfuse_win_redirect_stderr(void) {
+	const char* programdata = getenv("ProgramData");
+	if(!programdata)
+		return;
+	char path[MAX_PATH];
+	if(snprintf(path, sizeof(path), "%s\\hfsfuse", programdata) >= (int)sizeof(path))
+		return;
+	CreateDirectoryA(path, NULL);
+	if(strlen(path) + strlen("\\hfsfuse.log") >= sizeof(path))
+		return;
+	strcat(path, "\\hfsfuse.log");
+	if(freopen(path, "a", stderr))
+		setvbuf(stderr, NULL, _IONBF, 0);
+}
+
+// WinFsp.Launcher starts hfsfuse with the share the user mapped as the volume, in volume prefix form
+// (\hfsfuse\PhysicalDriveN); the UNC form (\\hfsfuse\PhysicalDriveN) is accepted too for manual use.
+// Translate it to the raw device and keep it as volume prefix so Explorer lists the mapped drive.
+// Only PhysicalDriveN shares are accepted since the launcher runs hfsfuse as LocalSystem.
+static int hfsfuse_win_resolve_unc(char** device, char** volume_prefix) {
+	static const char class_name[] = "hfsfuse\\";
+	const size_t class_len = sizeof(class_name) - 1;
+	const char* dev = *device;
+	const char* server = dev[0] == '\\' && dev[1] == '\\' ? dev + 2 : dev[0] == '\\' ? dev + 1 : NULL;
+	if(!server || _strnicmp(server, class_name, class_len))
+		return 0;
+
+	hfsfuse_win_redirect_stderr();
+	time_t now = time(NULL);
+	char timestamp[32];
+	strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", localtime(&now));
+	fprintf(stderr, "[%s] hfsfuse %s: mounting %s\n", timestamp, HFSFUSE_VERSION_STRING, dev);
+
+	const char* share = server + class_len;
+	static const char drive_prefix[] = "PhysicalDrive";
+	const size_t prefix_len = sizeof(drive_prefix) - 1;
+	if(_strnicmp(share, drive_prefix, prefix_len)) {
+		fprintf(stderr, "Error: unsupported UNC path %s, expected \\\\hfsfuse\\PhysicalDriveN\n", dev);
+		return -1;
+	}
+	const char* number = share + prefix_len;
+	size_t digits = strspn(number, "0123456789");
+	if(!digits || digits > 3 || number[digits]) {
+		fprintf(stderr, "Error: unsupported UNC path %s, expected \\\\hfsfuse\\PhysicalDriveN\n", dev);
+		return -1;
+	}
+
+	char* raw = malloc(strlen("\\\\.\\") + strlen(share) + 1);
+	char* prefix = malloc(strlen("--VolumePrefix=\\") + strlen(server) + 1);
+	if(!raw || !prefix) {
+		free(raw);
+		free(prefix);
+		return -1;
+	}
+	strcpy(raw, "\\\\.\\");
+	strcat(raw, share);
+	strcpy(prefix, "--VolumePrefix=\\"); // WinFsp expects \Server\Share
+	strcat(prefix, server);
+	free(*device);
+	*device = raw;
+	*volume_prefix = prefix;
+	return 0;
+}
+#endif
+
 #ifndef HFSFUSE_VERSION_STRING
 #include "version.h"
 #endif
@@ -959,7 +1059,11 @@ static int hfsfuse_opt_proc(void* data, const char* arg, int key, struct fuse_ar
 			fuse_parse_cmdline(args, NULL, NULL, NULL);
 #endif
 			if(key == HFSFUSE_OPT_KEY_FULLHELP) {
-#if FUSE_VERSION < 30
+#if defined(_WIN32)
+				// WinFsp's fuse_new dereferences the channel, so let fuse_main print both option sets instead
+				fuse_opt_add_arg(args, "-h");
+				fuse_main(args->argc, args->argv, &hfsfuse_ops, NULL);
+#elif FUSE_VERSION < 30
 				fuse_opt_add_arg(args, "-ho");
 				// fuse_mount and fuse_new print their own set of options
 				fuse_mount("", args);
@@ -1009,6 +1113,11 @@ static void hfs_vsyslog(const char* fmt, const char* file, int line, va_list arg
 }
 
 int main(int argc, char* argv[]) {
+#ifdef _WIN32
+	if(hfsfuse_win_load_winfsp())
+		return 1;
+	char* volume_prefix = NULL;
+#endif
 	struct fuse_args args = FUSE_ARGS_INIT(argc, argv);
 
 	struct hfsfuse_config cfg = {0};
@@ -1022,6 +1131,13 @@ int main(int argc, char* argv[]) {
 		usage(args.argv[0],stderr);
 		goto opt_err;
 	}
+
+#ifdef _WIN32
+	if(hfsfuse_win_resolve_unc(&cfg.device, &volume_prefix))
+		goto done;
+	if(volume_prefix)
+		fuse_opt_add_arg(&args, volume_prefix);
+#endif
 
 	if(cfg.volume_config.rsrc_suff && strchr(cfg.volume_config.rsrc_suff,'/')) {
 		// FUSE tokenizes paths before lookup, so lookup would end at the file 'file.ext' before ever seeing e.g. 'file.ext/rsrc'.
@@ -1048,6 +1164,10 @@ int main(int argc, char* argv[]) {
 	fuse_opt_add_opt(&opts, "use_ino");
 #endif
 	fuse_opt_add_opt(&opts, "subtype=hfs");
+#ifdef _WIN32
+	// map file ownership to the mounting user, keep files readable for everyone and hide macOS dot files in Explorer
+	fuse_opt_add_opt(&opts, "uid=-1,gid=-1,umask=022,dothidden");
+#endif
 	hfsfuse_opt_add_opt_escaped(&opts, fsname);
 	fuse_opt_add_arg(&args, "-o");
 	fuse_opt_add_arg(&args, opts);
@@ -1074,6 +1194,23 @@ int main(int argc, char* argv[]) {
 			goto done;
 		}
 	}
+#ifdef _WIN32
+	// show the HFS+ volume name as the drive label in Explorer
+	char volname[HFS_NAME_MAX+1];
+	if(hfs_unistr_to_utf8(&vol.name, volname) > 0) {
+		char* volname_opt = malloc(strlen("volname=") + strlen(volname) + 1);
+		char* volname_opts = NULL;
+		if(volname_opt) {
+			strcpy(volname_opt, "volname=");
+			strcat(volname_opt, volname);
+			hfsfuse_opt_add_opt_escaped(&volname_opts, volname_opt);
+			fuse_opt_add_arg(&args, "-o");
+			fuse_opt_add_arg(&args, volname_opts);
+			free(volname_opts);
+			free(volname_opt);
+		}
+	}
+#endif
 	if(!cfg.foreground)
 		hfs_gcb.error = hfs_vsyslog; // prepare to daemonize
 
@@ -1081,6 +1218,9 @@ int main(int argc, char* argv[]) {
 
 done:
 	free(cfg.device);
+#ifdef _WIN32
+	free(volume_prefix);
+#endif
 opt_err:
 	fuse_opt_free_args(&args);
 	return ret;

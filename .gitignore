@@ -14,3 +14,4 @@
 *.exe
 /log*.txt
 /third_party/winfsp/lib/*.dll.a
+/third_party/winfsp/lib/*.def

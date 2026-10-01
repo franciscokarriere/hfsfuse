@@ -14,7 +14,8 @@ Portar y compilar la herramienta `hfsfuse` para entornos Windows 64-bits utiliza
 | 2   | **Completado**  | Capa de Compatibilidad POSIX        | Creado `win_compat.h` para emular `stpcpy`, `localtime_r`, `syslog` y definiendo `ST_RDONLY`.                             |
 | 3   | **Completado**  | Resolución de Conflicto `fuse_stat` | `win_compat.h` incluye `<fuse.h>` primero y no redefine `stat`/`statvfs`; `hfsfuse.c` convierte `struct stat` → `struct fuse_stat` con `stat_to_fuse_stat()`. |
 | 4   | **Completado**  | Compilación y Enlace Final          | `hfsfuse.exe` generado en la raíz, enlazado contra `winfsp-x64.dll` (ver Error 3). Sin advertencias con `-Wall -Wextra`. |
-| 5   | **Pendiente**   | Pruebas de Montaje                  | Validación funcional montando una imagen/partición HFS+ en Windows.                                                       |
+| 5   | **Completado**  | Pruebas de Montaje                  | Memoria USB de 8 GB (APM, HFS+ con journal) montada y leída desde el Explorador sin privilegios de administrador. |
+| 6   | **Completado**  | Integración con el Explorador       | Servicio de WinFsp.Launcher (`scripts/install-windows.ps1`): `net use M: \hfsfusePhysicalDriveN` o "Conectar a unidad de red". |
 
 ---
 
@@ -77,3 +78,24 @@ Requisito del volumen: journal desactivado (`diskutil disableJournal /Volumes/NO
 | 4    | **Pendiente** | xattrs, `chmod`/`chown`, flush al desmontar, pruebas de concurrencia                                        | Uso diario con varias aplicaciones en paralelo                |
 
 Fuera de alcance inicial: escribir archivos comprimidos (decmpfs), crear hard links, escritura del journal.
+
+## 6. Uso desde el Explorador de Windows (WinFsp.Launcher)
+
+Un proceso elevado crea letras de unidad invisibles para el Explorador normal, por eso hfsfuse se registra como servicio de WinFsp.Launcher, que lo ejecuta como LocalSystem (puede leer el disco en bruto) y expone la unidad en la sesión del usuario.
+
+```powershell
+# Compilar (genera hfsfuse.exe autónomo: zlib/winpthread estáticos, winfsp-x64.dll con carga diferida)
+C:\msys64\usr\bin\env.exe MSYSTEM=UCRT64 /usr/bin/bash -l scripts/build-windows.sh
+
+# Instalar (PowerShell de administrador, una sola vez)
+powershell -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1 [-AllowDirtyJournal]
+
+# Montar / desmontar (usuario normal)
+net use M: \hfsfuse\PhysicalDrive3
+net use M: /delete
+```
+
+- El launcher pasa la ruta como `\hfsfuse\PhysicalDriveN` (`%1`) y la letra (`%2`); hfsfuse la traduce a `\.\PhysicalDriveN` y solo acepta discos físicos.
+- Una instancia por disco: mapear el mismo disco dos veces devuelve `STATUS_OBJECT_NAME_COLLISION` (`c0000035`).
+- Diagnóstico: `C:\ProgramData\hfsfuse\hfsfuse.log` y el Visor de eventos (origen `WinFsp`).
+- Opciones por defecto en Windows: `uid=-1,gid=-1,umask=022,dothidden` y `volname` con el nombre del volumen HFS+.
