@@ -10,6 +10,7 @@ CONFIG_CFLAGS ?= -O3
 CONFIG_CFLAGS := $(CONFIG_CFLAGS) $(CFLAGS)
 
 CFLAGS := $(CONFIG_CFLAGS)
+APP_FLAGS += -I$(abspath .)
 
 # extra flags we don't want to forward to external libs like libhfs/ublio/utf8proc/lzvn
 LOCAL_CFLAGS+=-std=gnu11 -D_FILE_OFFSET_BITS=64 -Wall -Wextra -pedantic -Wno-gnu-zero-variadic-macro-arguments -Wno-unused-parameter -Wno-error=type-limits -Wno-tautological-constant-out-of-range-compare
@@ -67,14 +68,15 @@ $(warning building with ublio is not supported under MSYS2)
 	endif
 	TARGETS = hfsdump
 else ifeq (MINGW, $(findstring MINGW, $(OS)))
-$(info MinGW detected, FUSE driver will not be built)
+$(info MinGW detected, enabling WinFSP/FUSE support)
 	WITH_UBLIO ?= none
 	ifneq ($(WITH_UBLIO), none)
 $(warning building with ublio is not supported under MinGW)
 	endif
 	APP_LIB += -static
-	APP_FLAGS += -D_POSIX_THREAD_SAFE_FUNCTIONS
-	TARGETS = hfsdump
+	APP_FLAGS += -D_POSIX_THREAD_SAFE_FUNCTIONS -D_WIN32_WINNT=0x0601
+	FUSE_FLAGS += -I$(abspath third_party/winfsp/lib)
+	FUSE_LIB ?= -L$(abspath third_party/winfsp/lib) -l:libfuse-2.8.dll.a
 else #linux
 	ifeq ($(findstring _POSIX_C_SOURCE, $(LOCAL_CFLAGS)),)
 		FUSE_FLAGS += -D_GNU_SOURCE #for statx

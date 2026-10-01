@@ -17,7 +17,17 @@
 #include <fuse3/fuse.h>
 #endif
 
+#ifndef _WIN32
 #include <syslog.h>
+#else
+#include <stdio.h>
+#define LOG_ERR 3
+#define LOG_INFO 6
+#define LOG_DEBUG 7
+#define openlog(ident, option, facility) ((void)0)
+#define syslog(priority, format, ...) fprintf(stderr, format "\n", ##__VA_ARGS__)
+#define closelog() ((void)0)
+#endif
 
 #ifndef HFSFUSE_VERSION_STRING
 #include "version.h"
@@ -34,6 +44,9 @@
 #if FUSE_DARWIN_ENABLE_EXTENSIONS
 typedef struct fuse_darwin_attr stat_type;
 typedef fuse_darwin_fill_dir_t fill_dir_type;
+#elif defined(_WIN32)
+typedef struct fuse_stat stat_type;
+typedef fuse_fill_dir_t fill_dir_type;
 #else
 typedef struct stat stat_type;
 typedef fuse_fill_dir_t fill_dir_type;
@@ -166,6 +179,28 @@ static int hfsfuse_readlink(const char* path, char* buf, size_t size) {
 #endif
 #endif
 
+#if defined(_WIN32) && !FUSE_DARWIN_ENABLE_EXTENSIONS
+// WinFSP expects struct fuse_stat, whose layout differs from the MinGW struct stat filled by hfs_stat.
+// st_ino and the birth time are taken from the catalog record since MinGW's st_ino is only 16 bits wide.
+static struct fuse_stat stat_to_fuse_stat(const hfs_volume* vol, const hfs_catalog_keyed_record_t* rec, const struct stat* st) {
+	return (struct fuse_stat){
+		.st_ino = rec->file.cnid,
+		.st_mode = st->st_mode,
+		.st_nlink = st->st_nlink,
+		.st_uid = st->st_uid,
+		.st_gid = st->st_gid,
+		.st_rdev = st->st_rdev,
+		.st_size = st->st_size,
+		.st_atim.tv_sec = st->st_atime,
+		.st_mtim.tv_sec = st->st_mtime,
+		.st_ctim.tv_sec = st->st_ctime,
+		.st_birthtim.tv_sec = HFSTIMETOEPOCH(rec->file.date_created),
+		.st_blksize = vol->vh.block_size,
+		.st_blocks = (st->st_size + 511) / 512,
+	};
+}
+#endif
+
 static int hfsfuse_fgetattr(const char* path, stat_type* st, struct fuse_file_info* info) {
 	struct hfsfuse_file* f = (struct hfsfuse_file*)info->fh;
 
@@ -178,6 +213,11 @@ static int hfsfuse_fgetattr(const char* path, stat_type* st, struct fuse_file_in
 	hfs_catalog_keyed_record_t rec = hfs_file_get_catalog_record(f->file);
 	hfs_file_stat(f->file,&stbuf);
 	*st = stat_to_fuse_darwin_attr(rec,stbuf);
+#elif defined(_WIN32)
+	struct stat stbuf;
+	hfs_catalog_keyed_record_t rec = hfs_file_get_catalog_record(f->file);
+	hfs_file_stat(f->file,&stbuf);
+	*st = stat_to_fuse_stat(fuse_get_context()->private_data,&rec,&stbuf);
 #else
 	hfs_file_stat(f->file,st);
 #endif
@@ -190,6 +230,8 @@ static int hfsfuse_fgetattr(const char* path, stat_type* st, struct fuse_file_in
 
 #if FUSE_VERSION >= 30
 static int hfsfuse_getattr(const char* path, stat_type* st, struct fuse_file_info *fi) {
+#elif defined(_WIN32)
+static int hfsfuse_getattr(const char* path, stat_type* st) {
 #else
 static int hfsfuse_getattr(const char* path, struct stat* st) {
 #endif
@@ -210,6 +252,10 @@ static int hfsfuse_getattr(const char* path, struct stat* st) {
 	struct stat statbuf;
 	hfs_stat(vol,&rec,&statbuf,fork);
 	*st = stat_to_fuse_darwin_attr(rec,statbuf);
+#elif defined(_WIN32)
+	struct stat statbuf;
+	hfs_stat(vol,&rec,&statbuf,fork);
+	*st = stat_to_fuse_stat(vol,&rec,&statbuf);
 #else
 	hfs_stat(vol,&rec,st,fork);
 #endif
@@ -363,6 +409,9 @@ static int hfsfuse_readdir(const char* path, void* buf, fuse_fill_dir_t filler, 
 		ret = filler(buf, ".", &stat_to_fuse_darwin_attr(d->dir_record,st), 1, FUSE_FILL_DIR_PLUS);
 #elif FUSE_VERSION >= 30
 		ret = filler(buf, ".", &st, 1, FUSE_FILL_DIR_PLUS);
+#elif defined(_WIN32)
+		struct fuse_stat fst = stat_to_fuse_stat(vol, &d->dir_record, &st);
+		ret = filler(buf, ".", &fst, 1);
 #else
 		ret = filler(buf, ".", &st, 1);
 #endif
@@ -384,6 +433,11 @@ static int hfsfuse_readdir(const char* path, void* buf, fuse_fill_dir_t filler, 
 		ret = filler(buf, "..", stp ? &stat_to_fuse_darwin_attr(rec,*stp) : NULL, 2, stp ? FUSE_FILL_DIR_PLUS : 0);
 #elif FUSE_VERSION >= 30
 		ret = filler(buf, "..", stp, 2, stp ? FUSE_FILL_DIR_PLUS : 0);
+#elif defined(_WIN32)
+		struct fuse_stat fst;
+		if(stp)
+			fst = stat_to_fuse_stat(vol, &rec, stp);
+		ret = filler(buf, "..", stp ? &fst : NULL, 2);
 #else
 		ret = filler(buf, "..", stp, 2);
 #endif
@@ -431,6 +485,9 @@ static int hfsfuse_readdir(const char* path, void* buf, fuse_fill_dir_t filler, 
 		ret = filler(buf,pelem,&stat_to_fuse_darwin_attr(*record,st),i+3,FUSE_FILL_DIR_PLUS);
 #elif FUSE_VERSION >= 30
 		ret = filler(buf,pelem,&st,i+3,FUSE_FILL_DIR_PLUS);
+#elif defined(_WIN32)
+		struct fuse_stat fst = stat_to_fuse_stat(vol, record, &st);
+		ret = filler(buf,pelem,&fst,i+3);
 #else
 		ret = filler(buf,pelem,&st,i+3);
 #endif
@@ -457,6 +514,22 @@ static int hfsfuse_statfs(const char* path, struct statfs* st) {
 	return 0;
 }
 #else
+#if defined(_WIN32)
+static int hfsfuse_statfs(const char* path, struct fuse_statvfs* st) {
+	hfs_volume* vol = fuse_get_context()->private_data;
+	st->f_bsize = vol->vh.block_size;
+	st->f_frsize = st->f_bsize;
+	st->f_blocks = vol->vh.total_blocks;
+	st->f_bfree = vol->vh.free_blocks;
+	st->f_bavail = st->f_bfree;
+	st->f_files = UINT32_MAX - HFS_CNID_USER;
+	st->f_ffree = st->f_files - vol->vh.file_count - vol->vh.folder_count;
+	st->f_favail = st->f_ffree;
+	st->f_flag = ST_RDONLY;
+	st->f_namemax = HFS_NAME_MAX;
+	return 0;
+}
+#else
 static int hfsfuse_statfs(const char* path, struct statvfs* st) {
 	hfs_volume* vol = fuse_get_context()->private_data;
 	st->f_bsize = vol->vh.block_size;
@@ -471,6 +544,7 @@ static int hfsfuse_statfs(const char* path, struct statvfs* st) {
 	st->f_namemax = HFS_NAME_MAX;
 	return 0;
 }
+#endif
 #endif
 
 #if defined(__APPLE__) && FUSE_VERSION < 30

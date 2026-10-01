@@ -9,3 +9,8 @@
 /hfsdump
 /hfsfuse
 /hfstar
+
+# Windows build artifacts
+*.exe
+/log*.txt
+/third_party/winfsp/lib/*.dll.a
