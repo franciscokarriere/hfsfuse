@@ -19,6 +19,14 @@
 
 #include "unicode.h"
 
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#include <winioctl.h>
+#include <io.h>
+#endif
+
 #ifdef __MINGW32__
 // mignw doesn't provide these types but defines the corresponding fields in struct stat as follows
 typedef short uid_t;
@@ -51,6 +59,7 @@ typedef short gid_t;
 struct hfs_device {
 	int fd;
 	uint32_t blksize;
+	uint64_t part_offset; // byte offset of the HFS partition within the device, 0 for bare volumes
 	struct hfs_record_cache* cache;
 	char* rsrc_suff;
 	size_t rsrc_len;
@@ -549,6 +558,46 @@ typedef struct partinfo diskinfo_type;
 
 #define BAIL(e) do { err = e; goto error; } while(0)
 
+static int hfs_find_apm_partition(struct hfs_device* dev);
+
+#ifdef _WIN32
+// The CRT's open() and fstat() don't handle raw devices (\\.\PhysicalDriveN) reliably,
+// so open with CreateFileW and wrap the handle in a CRT file descriptor.
+static int hfs_win_open(const char* name) {
+	wchar_t wname[MAX_PATH];
+	if(!MultiByteToWideChar(CP_UTF8, 0, name, -1, wname, MAX_PATH)) {
+		errno = ENAMETOOLONG;
+		return -1;
+	}
+	HANDLE h = CreateFileW(wname, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+	if(h == INVALID_HANDLE_VALUE) {
+		DWORD winerr = GetLastError();
+		hfslib_error("could not open %s: Windows error %lu", NULL, 0, name, (unsigned long)winerr);
+		if(winerr == ERROR_ACCESS_DENIED)
+			errno = EACCES;
+		else if(winerr == ERROR_FILE_NOT_FOUND || winerr == ERROR_PATH_NOT_FOUND)
+			errno = ENOENT;
+		else errno = EIO;
+		return -1;
+	}
+	int fd = _open_osfhandle((intptr_t)h, _O_RDONLY | _O_BINARY);
+	if(fd < 0)
+		CloseHandle(h);
+	return fd;
+}
+
+// Returns the sector size of a disk device, or 0 if the handle isn't a disk.
+static uint32_t hfs_win_sector_size(int fd) {
+	DISK_GEOMETRY geom;
+	DWORD geom_size;
+	HANDLE h = (HANDLE)_get_osfhandle(fd);
+	if(h == INVALID_HANDLE_VALUE ||
+	   !DeviceIoControl(h, IOCTL_DISK_GET_DRIVE_GEOMETRY, NULL, 0, &geom, sizeof(geom), &geom_size, NULL))
+		return 0;
+	return geom.BytesPerSector ? geom.BytesPerSector : 512;
+}
+#endif
+
 int hfs_open(hfs_volume* vol, const char* name, hfs_callback_args* cbargs) {
 	int err = errno = 0;
 
@@ -561,12 +610,13 @@ int hfs_open(hfs_volume* vol, const char* name, hfs_callback_args* cbargs) {
 	if(cbargs && cbargs->openvol)
 		cfg = *(struct hfs_volume_config*)cbargs->openvol;
 
-	int open_flags = O_RDONLY;
 #ifdef _WIN32
-	open_flags |= O_BINARY;
-#endif
-	if((dev->fd = open(name,open_flags)) < 0)
+	if((dev->fd = hfs_win_open(name)) < 0)
 		BAIL(errno);
+#else
+	if((dev->fd = open(name,O_RDONLY)) < 0)
+		BAIL(errno);
+#endif
 
 	dev->default_fork = cfg.rsrc_only ? HFS_RSRCFORK : HFS_DATAFORK;
 	if(cfg.rsrc_suff) {
@@ -577,6 +627,11 @@ int hfs_open(hfs_volume* vol, const char* name, hfs_callback_args* cbargs) {
 
 	if(cfg.blksize)
 		dev->blksize = cfg.blksize;
+#ifdef _WIN32
+	// raw devices require sector aligned reads; regular image files fall through to fstat
+	else if((dev->blksize = hfs_win_sector_size(dev->fd)))
+		;
+#endif
 	else {
 		struct stat st;
 		if(fstat(dev->fd, &st))
@@ -643,6 +698,9 @@ int hfs_open(hfs_volume* vol, const char* name, hfs_callback_args* cbargs) {
 		if((err = pthread_mutex_init(&dev->read_mutex,NULL)))
 			goto error;
 	}
+
+	if((err = hfs_find_apm_partition(dev)))
+		goto error;
 
 	return 0;
 
@@ -753,9 +811,62 @@ static inline int hfs_read_pread(struct hfs_device* dev, void* outbytes, uint64_
 	return 0;
 }
 
+static inline int hfs_device_read_raw(struct hfs_device* dev, void* buf, uint64_t length, uint64_t offset) {
+#ifdef HAVE_UBLIO
+	if(dev->use_ublio)
+		return hfs_read_ublio(dev, buf, length, offset);
+#endif
+	return hfs_read_pread(dev, buf, length, offset);
+}
+
+static inline uint16_t apm_be16(const unsigned char* p) { return (uint16_t)(p[0] << 8 | p[1]); }
+static inline uint32_t apm_be32(const unsigned char* p) { return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3]; }
+
+// Apple Partition Map: a Driver Descriptor Record ("ER") in block 0 followed by one
+// partition entry ("PM") per block. If present, locate the first Apple_HFS/Apple_HFSX
+// partition and read the volume relative to it. Devices without an APM are left untouched.
+static int hfs_find_apm_partition(struct hfs_device* dev) {
+	enum { APM_MAX_ENTRIES = 256, APM_MAX_BLKSIZE = 4096 };
+	unsigned char* buf = malloc(APM_MAX_BLKSIZE);
+	if(!buf)
+		return ENOMEM;
+
+	int ret = 0;
+	dev->part_offset = 0;
+	if(hfs_device_read_raw(dev, buf, 512, 0) || apm_be16(buf) != 0x4552) // "ER"
+		goto end;
+
+	uint32_t apm_blksize = apm_be16(buf + 2);
+	if(apm_blksize < 512 || apm_blksize > APM_MAX_BLKSIZE || apm_blksize % 512)
+		goto end;
+
+	uint32_t nentries = 1;
+	for(uint32_t i = 1; i <= nentries && i <= APM_MAX_ENTRIES; i++) {
+		if(hfs_device_read_raw(dev, buf, 512, (uint64_t)i * apm_blksize) || apm_be16(buf) != 0x504D) // "PM"
+			break;
+		nentries = apm_be32(buf + 4);
+
+		char type[33];
+		memcpy(type, buf + 48, 32);
+		type[32] = '\0';
+		if(strcmp(type, "Apple_HFS") && strcmp(type, "Apple_HFSX"))
+			continue;
+
+		uint64_t start = apm_be32(buf + 8), count = apm_be32(buf + 12);
+		if(!start || !count)
+			continue;
+		dev->part_offset = start * apm_blksize;
+		break;
+	}
+
+end:
+	free(buf);
+	return ret;
+}
+
 int hfs_read(hfs_volume* vol, void* outbytes, uint64_t length, uint64_t offset, hfs_callback_args* cbargs) {
 	struct hfs_device* dev = vol->cbdata;
-	offset += vol->offset;
+	offset += vol->offset + dev->part_offset;
 	int ret;
 #ifdef HAVE_UBLIO
 	if(dev->use_ublio) {
